@@ -190,16 +190,56 @@ function liveCells(
 
 // True when a 2x2 block of wall/box cells holds a box that is not on a goal:
 // no box in such a block can ever move, so the position is dead.
+// A cell counts as blocking only when it is not walkable (a true wall) or
+// holds a box. Walkable cells that boxes may not enter (the hallway / room
+// entry) are NOT walls: the player can stand there and push a box out of the
+// block along the room, so treating them as walls falsely freezes boxes that
+// sit in a room's door cell.
 function frozen2x2(
-  boxFloor: Uint8Array,
+  walkFloor: Uint8Array,
   boxAt: Uint8Array,
   goalSet: Uint8Array,
   w: number,
   h: number,
 ): boolean {
-  const occ = (i: number): boolean => !boxFloor[i] || boxAt[i] === 1;
+  const occ = (i: number): boolean => !walkFloor[i] || boxAt[i] === 1;
   for (let y = 0; y + 1 < h; y++) {
     for (let x = 0; x + 1 < w; x++) {
+      const a = y * w + x;
+      const b = a + 1;
+      const c = a + w;
+      const d = a + w + 1;
+      if (!occ(a) || !occ(b) || !occ(c) || !occ(d)) continue;
+      for (const i of [a, b, c, d]) {
+        if (boxAt[i] === 1 && goalSet[i] !== 1) return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Same verdict as frozen2x2, but only for the 2x2 blocks that contain
+// `cell` — used when checking a successor after one push. A push changes
+// occupancy only at the vacated cell (a box leaves) and at `cell` (a box
+// arrives), and every state the search expands is itself freeze-free, so no
+// block that avoids `cell` can newly freeze: it is unchanged or lost a box.
+// This keeps the per-candidate cost constant instead of scanning the board.
+function frozen2x2At(
+  walkFloor: Uint8Array,
+  boxAt: Uint8Array,
+  goalSet: Uint8Array,
+  w: number,
+  h: number,
+  cell: number,
+): boolean {
+  const occ = (i: number): boolean => !walkFloor[i] || boxAt[i] === 1;
+  const cx = cell % w;
+  const cy = (cell / w) | 0;
+  for (let oy = -1; oy <= 0; oy++) {
+    for (let ox = -1; ox <= 0; ox++) {
+      const x = cx + ox;
+      const y = cy + oy;
+      if (x < 0 || y < 0 || x + 1 >= w || y + 1 >= h) continue;
       const a = y * w + x;
       const b = a + 1;
       const c = a + w;
@@ -279,7 +319,7 @@ function pushAStar(
   }
   const boxAt0 = new Uint8Array(w * h);
   for (const b of startBoxes) boxAt0[b] = 1;
-  if (frozen2x2(boxFloor, boxAt0, goalSet, w, h)) return null;
+  if (frozen2x2(walkFloor, boxAt0, goalSet, w, h)) return null;
   const h0 = heuristic(startBoxes, goals, distFromGoal);
   if (h0 === Infinity) return null;
 
@@ -401,7 +441,7 @@ function pushAStar(
         }
         if (dead) continue;
         for (const x of nb) boxAt[x] = 1;
-        const fr = frozen2x2(boxFloor, boxAt, goalSet, w, h);
+        const fr = frozen2x2At(walkFloor, boxAt, goalSet, w, h, to);
         for (const x of nb) boxAt[x] = 0;
         if (fr) continue;
         const h2 = heuristic(nb, goals, distFromGoal);
@@ -578,6 +618,11 @@ function solve(text: string): string {
     const lv = parseLevel(text);
     const rooms = solveRooms(lv);
     if (rooms !== null) return rooms;
+    // Last resort only: a whole-level push search cannot solve 8+ boxes in
+    // any realistic budget, and an unbounded fallback burns the set's whole
+    // wall clock (and every other instance with it) on a hopeless search.
+    // Cap it small so one bad room can never zero the whole set.
+    if (lv.boxes.length > 6) return '';
     const floor = new Uint8Array(lv.w * lv.h);
     for (let c = 0; c < lv.w * lv.h; c++) if (!lv.wall[c]) floor[c] = 1;
     const res = pushAStar(
@@ -589,7 +634,7 @@ function solve(text: string): string {
       lv.goals,
       lv.player,
       -1,
-      Math.max(0, TOTAL_BUDGET - spent),
+      Math.min(100_000, Math.max(0, TOTAL_BUDGET - spent)),
     );
     if (res === null) return '';
     spent += res.expansions;
